@@ -1,0 +1,18 @@
+K2Rebuild/
+ ├── Dockerfile
+ ├── docker-compose.yml
+ ├── fwtool.sh
+ ├── tools/
+ │    ├── download_latest_k2plus_fw.py
+ │    └── firmware_validator.py
+ ├── output/                  ← all runtime data lives here
+ │    ├── firmware/           ← downloaded .img firmware files
+ │    ├── logs/               ← validation logs & reports
+ │    ├── extracted/          ← binwalk output
+ │    ├── debian-rootfs/      ← bootstrapped OS
+ │    ├── reports/            ← markdown/json validation outputs
+ │    └── ...
+ ├── build_and_run_fwtool.sh
+ ├── README.md
+ ├── LICENSE
+ └── .gitignore

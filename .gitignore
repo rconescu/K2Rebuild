@@ -1,0 +1,17 @@
+---
+
+## 🧾 `.gitignore`
+
+```gitignore
+# build outputs
+K2Rebuild_work/
+*.tar.gz
+*.img
+*.squashfs
+*.extracted/
+__pycache__/
+*.log
+.DS_Store
+# Output artifacts and logs (do not commit)
+output/
+output/**
