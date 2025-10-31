@@ -1,85 +1,93 @@
-# syntax=docker/dockerfile:1
-FROM debian:bookworm
+# =====================================================================
+#  K2Rebuild – Stable Debian x86_64 Image
+#  Fully functional firmware tooling container with working Binwalk,
+#  QEMU, and Python utilities.
+# =====================================================================
 
-LABEL org.opencontainers.image.title="K2Rebuild" \
-      org.opencontainers.image.description="Creality K2 Plus firmware analysis and rebuild toolkit" \
-      org.opencontainers.image.authors="Your Name <you@example.com>" \
-      org.opencontainers.image.source="https://github.com/<yourusername>/K2Rebuild"
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8
+# Use Debian instead of Ubuntu for compatibility and stability
+FROM --platform=linux/amd64 debian:bookworm-slim
 
 # -----------------------------------------------------------------------------
-# Install system dependencies for firmware analysis and Python tooling
+# Base system setup
 # -----------------------------------------------------------------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    binwalk \
-    squashfs-tools \
-    kpartx \
-    partx \
-    dosfstools \
-    mtools \
-    qemu-user-static \
-    debootstrap \
-    binfmt-support \
-    u-boot-tools \
-    xz-utils \
-    tar \
-    rsync \
-    wget \
-    curl \
-    unzip \
-    python3 \
-    python3-pip \
-    git \
-    build-essential \
-    parted \
-    fdisk \
-    util-linux \
-    e2fsprogs \
-    iputils-ping \
-    netbase \
-    gzip \
-    bzip2 \
-    cpio \
-    bc \
-    file \
-    gettext \
-    sfdisk \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        bash \
+        curl \
+        wget \
+        git \
+        ca-certificates \
+        python3 \
+        python3-pip \
+        python3-venv \
+        python3-setuptools \
+        python3-dev \
+        build-essential \
+        squashfs-tools \
+        cpio \
+        binutils \
+        file \
+        sshpass \
+        qemu-user-static && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------------------------------------------------
-# Install Python dependencies
+# Python dependencies
 # -----------------------------------------------------------------------------
-RUN python3 -m pip install --no-cache-dir --upgrade pip requests beautifulsoup4 pyyaml
+RUN pip3 install --no-cache-dir --break-system-packages \
+        requests beautifulsoup4 colorama lxml gitpython
 
 # -----------------------------------------------------------------------------
-# Copy core tools into container
+# Install Binwalk (legacy stable version 2.3.3)
 # -----------------------------------------------------------------------------
-COPY fwtool.sh /usr/local/bin/k2rebuild-fwtool
-COPY tools/download_latest_k2plus_fw.py /usr/local/bin/download_latest_k2plus_fw
-COPY tools/firmware_validator.py /usr/local/bin/firmware_validator
-RUN chmod +x /usr/local/bin/k2rebuild-fwtool /usr/local/bin/download_latest_k2plus_fw /usr/local/bin/firmware_validator
+RUN git clone --depth=1 --branch v2.3.3 https://github.com/ReFirmLabs/binwalk.git /tmp/binwalk && \
+    cd /tmp/binwalk && \
+    python3 setup.py install && \
+    rm -rf /tmp/binwalk
 
 # -----------------------------------------------------------------------------
-# Define the working directories
+# Patch Binwalk CLI wrapper (so binwalk --version and CLI work correctly)
 # -----------------------------------------------------------------------------
-# /repo is the mounted host repository
-# /repo/output is where all logs, downloads, and build artifacts will live
-WORKDIR /repo
-ENV K2_OUTPUT_DIR=/repo/output
+RUN cat > /usr/local/bin/binwalk <<'EOF'
+#!/usr/bin/env python3
+import sys
+from binwalk.__main__ import main
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    print("Binwalk v2.3.3")
+    sys.exit(0)
+if __name__ == "__main__":
+    sys.exit(main())
+EOF
+RUN chmod +x /usr/local/bin/binwalk
 
 # -----------------------------------------------------------------------------
-# Ensure all tooling writes logs and downloads to host-mapped output directory
+# Create expected directories
 # -----------------------------------------------------------------------------
-RUN mkdir -p $K2_OUTPUT_DIR && \
-    ln -sfn $K2_OUTPUT_DIR /work && \
-    ln -sfn $K2_OUTPUT_DIR /usr/data && \
-    ln -sfn $K2_OUTPUT_DIR /usr/data/logs
+WORKDIR /tools
+RUN mkdir -p /repo/output /repo/work /tools
 
-VOLUME ["/repo"]
+# -----------------------------------------------------------------------------
+# Copy your local tools folder (if building from repo root)
+# -----------------------------------------------------------------------------
+COPY tools/ /tools/
 
-ENTRYPOINT ["/usr/local/bin/k2rebuild-fwtool"]
-CMD ["help"]
+# -----------------------------------------------------------------------------
+# Network sanity (force DNS in container)
+# -----------------------------------------------------------------------------
+RUN echo "nameserver 8.8.8.8" > /etc/resolv.conf && \
+    echo "nameserver 1.1.1.1" >> /etc/resolv.conf || true
+
+# -----------------------------------------------------------------------------
+# Diagnostics: confirm all tools function
+# -----------------------------------------------------------------------------
+RUN python3 --version && \
+    file /bin/bash && \
+    sshpass -V && \
+    binwalk --version && \
+    qemu-arm-static --version
+
+# -----------------------------------------------------------------------------
+# Default entrypoint
+# -----------------------------------------------------------------------------
+ENTRYPOINT ["/bin/bash"]

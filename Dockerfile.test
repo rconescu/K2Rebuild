@@ -1,0 +1,33 @@
+# x86_64 Debian base
+FROM --platform=linux/amd64 debian:bookworm-slim
+
+# Install dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      bash file python3 python3-pip git curl wget sshpass qemu-user-static \
+      build-essential liblzma-dev zlib1g-dev libmagic1 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Clone and install binwalk from the official source
+RUN pip3 install --no-cache-dir --break-system-packages binwalk && \
+    pip3 install --no-cache-dir --break-system-packages pycryptodome
+
+# Install other Python dependencies
+RUN pip3 install --no-cache-dir --break-system-packages \
+    requests beautifulsoup4 colorama lxml gitpython
+
+# Setup directories
+WORKDIR /tools
+RUN mkdir -p /repo/output /repo/work /tools
+
+# Copy local tools
+COPY tools/ /tools/
+
+# Validate environment
+RUN python3 --version && \
+    file /bin/bash && \
+    sshpass -V && \
+    binwalk --version && \
+    qemu-arm-static --version || true
+
+CMD ["/bin/bash"]

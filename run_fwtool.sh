@@ -1,224 +1,185 @@
 #!/usr/bin/env bash
-# =============================================================================
-# K2Rebuild Orchestrator (Autonomous + Dual Menu)
-# -----------------------------------------------------------------------------
-# • Automatically ensures the freshest image (pulls/builds silently).
-# • Runs all firmware tasks inside the container — no manual execs.
-# • Provides:
-#     1. SIMPLE MENU: one-click full firmware build/test pipeline.
-#     2. ADVANCED MENU: manual control of each step.
-# • Removes containers after run, keeps the image cached.
-# • All results land in ./output/ on the host.
-# =============================================================================
+set -euo pipefail
 
-set -Eeuo pipefail
-IFS=$'\n\t'
+# ===============================================================
+#  K2Rebuild Firmware Build & Management Orchestrator (Final)
+# ===============================================================
 
-# --- CONFIG ------------------------------------------------------------------
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUTPUT_DIR="$REPO_DIR/output"
-COMPOSE_FILE="$REPO_DIR/docker-compose.yml"
-SERVICE_NAME="k2rebuild"
-IMAGE_REF="${IMAGE_REF:-k2rebuild:latest}"     # can be local or remote tag
-IMAGE_MODE="${IMAGE_MODE:-local}"              # "local" or "remote"
-SIMPLE_MODE_DEFAULT="1"                        # default to Simple menu
-LOG_FILE="$OUTPUT_DIR/host_orchestrator.log"
+# --- Configuration ---
+HOST_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOST_OUTPUT_DIR="${HOST_REPO_ROOT}/output"
+HOST_TOOLS_DIR="${HOST_REPO_ROOT}/tools"
 
-# --- UTILITIES ---------------------------------------------------------------
-timestamp() { date '+%Y-%m-%d %H:%M:%S'; }
-log(){ echo -e "[$(timestamp)] $*" | tee -a "$LOG_FILE"; }
+CONTAINER_OUTPUT_DIR="/repo/output"
+CONTAINER_TOOLS_DIR="/tools"
+CHECKPOINT_JSON="${HOST_OUTPUT_DIR}/progress.json"
+SSH_CONFIG_JSON="${HOST_OUTPUT_DIR}/ssh_config.json"
+AUTOHEAL_RETRIES="${AUTOHEAL_RETRIES:-2}"
 
-have_cmd() { command -v "$1" &>/dev/null; }
+# --- Validate repo structure ---
+if [[ ! -d "$HOST_OUTPUT_DIR" ]]; then
+  echo "❌ ERROR: Expected output directory not found: $HOST_OUTPUT_DIR"
+  echo "   → Please ensure you're running this script from the K2Rebuild repository root."
+  exit 1
+fi
 
-choose_compose_cmd() {
-  if have_cmd docker && docker compose version &>/dev/null; then
-    echo "docker compose"
-  elif have_cmd docker-compose; then
-    echo "docker-compose"
+if [[ ! -d "$HOST_TOOLS_DIR" ]]; then
+  echo "❌ ERROR: Expected tools directory not found: $HOST_TOOLS_DIR"
+  echo "   → Verify your ./tools folder exists and contains the orchestrator scripts."
+  exit 1
+fi
+
+# --- Utility functions ---
+timestamp() { date +"%Y-%m-%d %H:%M:%S"; }
+
+docker_exec() {
+  docker compose run --rm k2rebuild bash -lc "$1"
+}
+
+pause() { read -rp "Press Enter to continue..."; }
+
+print_checkpoint() {
+  if [[ -f "$CHECKPOINT_JSON" ]]; then
+    echo
+    echo "Checkpoint:"
+    jq -r '"\(.stage) (\(.timestamp))\n→ \(.description)"' "$CHECKPOINT_JSON"
   else
-    echo ""
+    echo
+    echo "(no progress.json yet)"
   fi
+  echo
 }
 
-ensure_compose() {
-  local cc
-  cc="$(choose_compose_cmd)"
-  if [[ -z "$cc" ]]; then
-    echo "❌ Docker Compose not found. Install Docker Desktop or docker-compose." >&2
-    exit 1
-  fi
-  echo "$cc"
-}
+# --- SSH verification helper ---
+verify_ssh() {
+  local host user password port
+  host="$1"; user="$2"; password="$3"; port="$4"
 
-ensure_output_dir() {
-  mkdir -p "$OUTPUT_DIR"
-  touch "$LOG_FILE"
-  if [[ ! -f "$REPO_DIR/.gitignore" ]] || ! grep -qE '^output/?$' "$REPO_DIR/.gitignore"; then
-    {
-      echo ""
-      echo "# Auto-added by run_fwtool.sh"
-      echo "output/"
-      echo "output/**"
-    } >> "$REPO_DIR/.gitignore"
-  fi
-}
-
-# --- IMAGE MANAGEMENT --------------------------------------------------------
-ensure_image_freshness() {
-  local cc; cc="$(ensure_compose)"
-  log "🧩 Checking image freshness (mode=$IMAGE_MODE, ref=$IMAGE_REF)..."
-
-  if [[ "$IMAGE_MODE" == "remote" ]]; then
-    # pull if digest differs
-    local local_digest remote_digest
-    local_digest="$(docker image inspect "$IMAGE_REF" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)"
-    docker pull "$IMAGE_REF" >/dev/null 2>&1 || true
-    remote_digest="$(docker image inspect "$IMAGE_REF" --format '{{index .RepoDigests 0}}' 2>/dev/null || true)"
-    if [[ "$remote_digest" != "$local_digest" ]]; then
-      log "⬇️  Updated image pulled: $IMAGE_REF"
-    else
-      log "✔️  Image already up-to-date."
-    fi
+  echo "[$(timestamp)] 🔌 Testing SSH connection to ${user}@${host}:${port}..."
+  if docker_exec "sshpass -p '$password' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 ${user}@${host} -p ${port} 'echo connected'" >/dev/null 2>&1; then
+    echo "[$(timestamp)] ✅ SSH connection verified."
+    return 0
   else
-    # local build
-    log "🔨 Building local image via compose (refreshing base layers only if newer)…"
-    $cc -f "$COMPOSE_FILE" build --pull "$SERVICE_NAME" >/dev/null
-    log "✔️  Local image verified fresh."
+    echo "[$(timestamp)] ❌ SSH connection failed."
+    return 1
   fi
 }
 
-# --- CORE RUNNER -------------------------------------------------------------
-run_in_container() {
-  local cc; cc="$(ensure_compose)"
-  local args=("$@")
-  $cc -f "$COMPOSE_FILE" run --rm "$SERVICE_NAME" "${args[@]}"
-}
+# --- Menu actions ---
+enter_credentials() {
+  echo "Enter your printer credentials:"
+  read -rp "IP Address: " host
+  read -rp "Username [root]: " user
+  user="${user:-root}"
+  read -rsp "Password: " password
+  echo
+  read -rp "Port [22]: " port
+  port="${port:-22}"
 
-# --- ACTIONS -----------------------------------------------------------------
-action_download_fw() {
-  log "Downloading latest K2 Plus firmware..."
-  run_in_container get-fw
-  log "✅ Firmware downloaded to ./output/firmware/"
-}
-
-action_extract_fw() {
-  log "Extracting firmware..."
-  local img
-  img="$(find "$OUTPUT_DIR/firmware" -type f -name '*.img' | sort | tail -n1 || true)"
-  if [[ -z "$img" ]]; then log "❌ No .img firmware found in ./output/firmware/"; return 1; fi
-  run_in_container extract "/repo/output/firmware/$(basename "$img")"
-  log "✅ Extraction complete."
-}
-
-action_bootstrap_debian() {
-  log "Bootstrapping Debian rootfs..."
-  run_in_container bootstrap-debian /repo/output/debian-rootfs arm64 bookworm
-  log "✅ Debian rootfs ready."
-}
-
-action_validate() {
-  log "Running full validation..."
-  local orig new
-  orig="$(find "$OUTPUT_DIR" -maxdepth 1 -type d -name '*.unsquash' | sort | tail -n1 || true)"
-  new="$OUTPUT_DIR/debian-rootfs"
-  if [[ -z "$orig" || ! -d "$new" ]]; then
-    log "❌ Missing original or rebuilt rootfs."; return 1
+  echo "[$(timestamp)] 🔍 Verifying SSH connection..."
+  if verify_ssh "$host" "$user" "$password" "$port"; then
+    jq -n --arg host "$host" --arg user "$user" --arg password "$password" --arg port "$port" \
+      '{host:$host, user:$user, password:$password, port:$port}' > "$SSH_CONFIG_JSON"
+    echo "[$(timestamp)] 💾 Credentials verified and saved."
+  else
+    echo "[$(timestamp)] 🚫 Credentials not saved (SSH verification failed)."
   fi
-  run_in_container validate "/repo${orig#"$REPO_DIR"}" /repo/output/debian-rootfs
-  log "✅ Validation complete. Reports in ./output/firmware-test-logs/"
+  pause
 }
 
-action_package() {
-  log "Packaging rebuilt rootfs..."
-  local ts out_tgz out_sqfs
-  ts="$(date +%Y%m%d-%H%M%S)"
-  out_tgz="/repo/output/k2_debian_${ts}.tar.gz"
-  out_sqfs="/repo/output/k2_debian_${ts}.squashfs"
-  run_in_container make-rootfs-tar /repo/output/debian-rootfs "$out_tgz"
-  run_in_container build-squashfs /repo/output/debian-rootfs "$out_sqfs"
-  log "✅ Packaged: $(basename "$out_tgz"), $(basename "$out_sqfs")"
+fetch_device_state() {
+  if [[ ! -f "$SSH_CONFIG_JSON" ]]; then
+    echo "❌ SSH credentials not found. Please enter them first."
+    pause
+    return
+  fi
+
+  local host user password port
+  host=$(jq -r .host "$SSH_CONFIG_JSON")
+  user=$(jq -r .user "$SSH_CONFIG_JSON")
+  password=$(jq -r .password "$SSH_CONFIG_JSON")
+  port=$(jq -r .port "$SSH_CONFIG_JSON")
+
+  echo "[$(timestamp)] 📡 Launching fetch_device_state.py (SSH metadata fetch)..."
+  docker_exec "python3 ${CONTAINER_TOOLS_DIR}/fetch_device_state.py \
+    --host ${host} --user ${user} --password ${password} --port ${port}" || true
+
+  echo
+  echo "🔎 Immediately checking for latest firmware from Creality and comparing versions…"
+  docker_exec "python3 ${CONTAINER_TOOLS_DIR}/generate_fw.py"
+  pause
 }
 
-action_full_pipeline() {
-  log "🚀 Starting full firmware build & test pipeline..."
-  ensure_image_freshness
-  action_download_fw
-  action_extract_fw
-  action_bootstrap_debian
-  action_validate
-  action_package
-  log "🎉 Full pipeline completed successfully."
+build_firmware() {
+  if [[ ! -f "$CHECKPOINT_JSON" ]]; then
+    echo "❌ Build blocked: device files or extracted image not found."
+    echo "→ Run 'Fetch device state' first."
+    pause
+    return
+  fi
+
+  echo "▶️ Launching firmware build pipeline..."
+  docker_exec "python3 ${CONTAINER_TOOLS_DIR}/orchestrator.py build" || true
+  pause
 }
 
-# --- MENUS -------------------------------------------------------------------
-simple_menu() {
+set_autoheal() {
+  read -rp "Enter new auto-heal retry count (current: ${AUTOHEAL_RETRIES}): " retries
+  export AUTOHEAL_RETRIES="${retries:-2}"
+  echo "✅ Auto-heal retries set to ${AUTOHEAL_RETRIES}"
+  pause
+}
+
+clean_output() {
+  echo "⚠️  This will remove all generated output files. Continue? [y/N]"
+  read -r confirm
+  if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+    rm -rf "${HOST_OUTPUT_DIR:?}/"*
+    echo "✅ Output directory cleaned."
+  fi
+  pause
+}
+
+show_progress() {
+  if [[ -f "$CHECKPOINT_JSON" ]]; then
+    echo "📊 Progress details:"
+    jq . "$CHECKPOINT_JSON"
+  else
+    echo "No progress file found."
+  fi
+  pause
+}
+
+# --- Menu loop ---
+while true; do
   clear
+  echo "==========================================================================================================================="
+  echo " K2Rebuild Automatic Firmware Runner"
+  echo "==========================================================================================================================="
+  echo "Time: $(timestamp)  |  Output: ${HOST_OUTPUT_DIR}"
+
+  print_checkpoint
+
   cat <<EOF
-========================================================
- K2Rebuild Simple Menu
-========================================================
-1) Run full firmware rebuild pipeline (auto-download, extract, rebuild, test, package)
-2) Exit
-========================================================
+1) Enter / verify printer SSH & save
+2) Fetch device state (from printer) + check latest firmware
+3) Build / Resume pipeline (auto-heal)
+4) Set auto-heal retry count (current: ${AUTOHEAL_RETRIES})
+5) Clean output folder
+6) Show progress details
+7) Exit
 EOF
-  read -rp "Select option [1-2]: " choice
+
+  echo
+  read -rp "Select: " choice
   case "$choice" in
-    1) action_full_pipeline ;;
-    2) echo "Bye!"; exit 0 ;;
-    *) echo "Invalid option."; sleep 1; simple_menu ;;
+    1) enter_credentials ;;
+    2) fetch_device_state ;;
+    3) build_firmware ;;
+    4) set_autoheal ;;
+    5) clean_output ;;
+    6) show_progress ;;
+    7) echo "👋 Exiting..."; exit 0 ;;
+    *) echo "Invalid option."; pause ;;
   esac
-}
-
-advanced_menu() {
-  clear
-  cat <<EOF
-========================================================
- K2Rebuild Advanced Menu
-========================================================
-1) Ensure freshest container image
-2) Download latest firmware
-3) Extract firmware image
-4) Bootstrap Debian rootfs
-5) Validate (original vs rebuilt)
-6) Package rebuilt rootfs
-7) Full pipeline (all steps)
-8) Exit
-========================================================
-EOF
-  read -rp "Select option [1-8]: " choice
-  case "$choice" in
-    1) ensure_image_freshness ;;
-    2) action_download_fw ;;
-    3) action_extract_fw ;;
-    4) action_bootstrap_debian ;;
-    5) action_validate ;;
-    6) action_package ;;
-    7) action_full_pipeline ;;
-    8) echo "Bye!"; exit 0 ;;
-    *) echo "Invalid option."; sleep 1 ;;
-  esac
-}
-
-# --- MAIN --------------------------------------------------------------------
-main() {
-  ensure_output_dir
-  ensure_image_freshness
-  local mode="${1:-menu}"
-  if [[ "$mode" == "--auto" ]]; then
-    # automatic noninteractive mode (full pipeline)
-    action_full_pipeline
-    exit 0
-  fi
-
-  echo "Choose menu mode:"
-  echo "1) Simple (full automation)"
-  echo "2) Advanced (manual steps)"
-  read -rp "> " menumode
-  case "$menumode" in
-    1|"") simple_menu ;;
-    2) advanced_menu ;;
-    *) simple_menu ;;
-  esac
-}
-
-main "$@"
+done

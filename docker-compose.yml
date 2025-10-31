@@ -1,13 +1,14 @@
 version: "3.9"
+
 services:
   k2rebuild:
-    build: .
-    image: k2rebuild:latest
-    container_name: k2rebuild
-    privileged: true
+    image: k2rebuild:x86
+    build:
+      context: .
+      dockerfile: Dockerfile
+    network_mode: "host"
     volumes:
-      - ./:/repo        # mount repo root
-      - ./output:/repo/output  # explicit mount for results
-    working_dir: /repo
+      - ./tools:/tools
+      - ./output:/repo/output
     tty: true
     stdin_open: true
